@@ -1,0 +1,31 @@
+.venv/
+__pycache__/
+*.pyc
+*.sqlite
+*.sqlite3
+*.db
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime data
+data/**
+!data/
+!data/sample-worksheet.pdf
+!data/rag/
+!data/rag/.gitkeep
+!data/rag/indexes/
+!data/rag/indexes/.gitkeep
+!data/rag/uploads/
+!data/rag/uploads/.gitkeep
+
+# Google credentials and tokens
+secrets/*
+secrets/google_oauth_client.json
+secrets/google_oauth_client.json.json
+secrets/tokens/
+!secrets/.gitkeep
+
+# Logs and generated output
+*.log
+*.jsonl

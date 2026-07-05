@@ -141,6 +141,57 @@ python assistant_cli.py rag-process --phone "+92XXXXXXXXXX" --document-id 1
 python assistant_cli.py rag-ask --phone "+92XXXXXXXXXX" "What is this chapter about?"
 ```
 
+## How RAG Works
+
+RAG means the bot answers from uploaded documents instead of guessing from memory.
+
+The flow is:
+
+1. Teacher uploads a PDF, DOCX, or TXT file through WhatsApp or the CLI.
+2. The file is stored in the local RAG folder and registered in SQLite.
+3. `rag-process` extracts text page by page.
+4. The text is cleaned and split into chunks.
+5. Chunks are saved with document metadata such as file name, chunk index, and page number.
+6. The chunks are indexed in ChromaDB for vector search.
+7. When the teacher asks a question, the bot retrieves the most relevant chunks.
+8. If ChromaDB is unavailable, the bot falls back to SQLite keyword search.
+9. The answer is generated from the retrieved context and includes source references and a confidence note.
+
+Example question flow:
+
+```text
+Teacher: Ask docs: What is photosynthesis?
+Bot: Based on the uploaded documents...
+Bot: Answer with source file names and page numbers.
+```
+
+This setup is useful for:
+
+- chapter Q&A
+- MCQ generation from notes
+- quick revision help for teachers and students
+- keeping a local searchable knowledge base for each project or class
+
+Simple RAG view:
+
+```mermaid
+flowchart LR
+	A[Upload document] --> B[Extract text]
+	B --> C[Chunk and store]
+	C --> D[Index in ChromaDB]
+	D --> E[Ask a question]
+	E --> F[Retrieve top chunks]
+	F --> G[Answer with sources]
+```
+
+Teacher example:
+
+```text
+Teacher uploads chapter.pdf
+Teacher asks: Explain Software in simple words
+Bot searches the chapter, pulls the best chunks, and replies with a sourced answer
+```
+
 ## WhatsApp Flow
 
 Typical teacher flow:

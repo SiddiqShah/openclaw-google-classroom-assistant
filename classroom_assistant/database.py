@@ -370,6 +370,41 @@ class Database:
             connection.commit()
             return int(cursor.lastrowid)
 
+    def create_draft_action(self, teacher_id: int, action_type: str, payload_json: str) -> int:
+        """Store a half-finished command that is waiting for more details."""
+        with closing(self.connect()) as connection:
+            connection.execute(
+                """
+                update pending_actions
+                set status = 'expired', updated_at = current_timestamp
+                where teacher_id = ? and status = 'awaiting'
+                """,
+                (teacher_id,),
+            )
+            cursor = connection.execute(
+                """
+                insert into pending_actions (teacher_id, action_type, payload_json, status)
+                values (?, ?, ?, 'awaiting')
+                """,
+                (teacher_id, action_type, payload_json),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+
+    def get_awaiting_action(self, teacher_id: int) -> dict[str, Any] | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """
+                select id, teacher_id, action_type, payload_json, status, created_at
+                from pending_actions
+                where teacher_id = ? and status = 'awaiting'
+                order by id desc
+                limit 1
+                """,
+                (teacher_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_latest_pending_action(self, teacher_id: int) -> dict[str, Any] | None:
         with closing(self.connect()) as connection:
             row = connection.execute(

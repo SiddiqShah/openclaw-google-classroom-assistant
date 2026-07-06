@@ -9,12 +9,14 @@ from .access_control import normalize_phone
 from .classroom_api import ClassroomService
 from .command_parser import ParsedCommand, render_preview
 from .content_generator import ContentGenerator
+from .conversation import fill_missing_text_fields, recompute_missing
 from .database import Database
 from .drive_service import DriveService
 from .file_receiver import FileReceiver
 from .file_receiver import StagedFile
 from .google_auth import GoogleAuthError
 from .local_file_search import LocalFileSearch, LocalFileSearchError
+from .report_query import resolve_named
 
 
 class WorkflowService:
@@ -25,6 +27,142 @@ class WorkflowService:
         self.file_receiver = FileReceiver(database, project_root=Path(__file__).resolve().parents[1])
         self.file_search = LocalFileSearch()
         self.generator = ContentGenerator()
+
+    def handle_command(self, phone: str, command: ParsedCommand, text: str = "") -> str:
+        """Entry point for a freshly parsed command.
+
+        Resolves the class dynamically from the teacher's real course list, then
+        either builds a preview (all details present) or remembers the request as
+        a draft and asks for what is still missing.
+        """
+        # A fresh command abandons any half-finished one from before.
+        teacher = self.database.get_teacher_by_phone(normalize_phone(phone))
+        if teacher is not None:
+            stale = self.database.get_awaiting_action(int(teacher["id"]))
+            if stale is not None:
+                self.database.update_pending_action_status(int(stale["id"]), "expired")
+
+        command = self._resolve_course_from_text(phone, command, text)
+        command = recompute_missing(command)
+        if command.is_complete:
+            return self.save_preview(phone, command)
+        self._store_draft(phone, command)
+        return self._ask_for_missing(command)
+
+    def continue_draft(self, phone: str, text: str) -> str | None:
+        """Merge a follow-up message into a waiting draft, if there is one.
+
+        Returns None when there is no draft or the message added nothing, so the
+        caller can fall back to normal routing.
+        """
+        teacher = self.database.get_teacher_by_phone(normalize_phone(phone))
+        if teacher is None:
+            return None
+        draft_row = self.database.get_awaiting_action(int(teacher["id"]))
+        if draft_row is None:
+            return None
+
+        command = self._command_from_payload(json.loads(str(draft_row["payload_json"])))
+
+        # Resolve the class first: if this reply supplied the class, a bare
+        # message should not also be taken as the title.
+        with_course = self._resolve_course_from_text(phone, command, text)
+        course_filled = not command.course and bool(with_course.course)
+        with_course = recompute_missing(with_course)
+
+        merged = fill_missing_text_fields(with_course, text, allow_bare_title=not course_filled)
+        if not self._added_detail(command, merged):
+            return None  # nothing new -> not an answer to our question
+
+        merged = recompute_missing(merged)
+        self.database.update_pending_action_status(int(draft_row["id"]), "superseded")
+        if merged.is_complete:
+            return self.save_preview(phone, merged)
+        self._store_draft(phone, merged)
+        return self._ask_for_missing(merged)
+
+    def _added_detail(self, before: ParsedCommand, after: ParsedCommand) -> bool:
+        return (
+            before.course != after.course
+            or before.title != after.title
+            or before.deadline != after.deadline
+            or before.marks != after.marks
+        )
+
+    def _resolve_course_from_text(self, phone: str, command: ParsedCommand, text: str) -> ParsedCommand:
+        try:
+            courses = self.classroom.list_courses(phone=phone, sync=False)
+        except GoogleAuthError:
+            return command
+        if not courses:
+            return command
+
+        # Leave explicit multi-class and "all classes" selections untouched.
+        if command.course and len(split_course_selectors(command.course)) > 1:
+            return command
+        if command.course.strip().lower() in {"all", "all classes", "all courses"}:
+            return command
+
+        match = None
+        if command.course:
+            match = resolve_named(courses, command.course, name_of=lambda c: c.display_name)
+        if match is None and text:
+            match = resolve_named(courses, text, name_of=lambda c: c.display_name)
+        if match is not None:
+            return replace(command, course=match.display_name)
+        return command
+
+    def _store_draft(self, phone: str, command: ParsedCommand) -> None:
+        teacher = self.database.get_teacher_by_phone(normalize_phone(phone))
+        if teacher is None:
+            raise GoogleAuthError("Teacher phone is not authorized.")
+        self.database.create_draft_action(
+            teacher_id=int(teacher["id"]),
+            action_type=command.intent,
+            payload_json=json.dumps(asdict(command)),
+        )
+
+    def _command_from_payload(self, payload: dict) -> ParsedCommand:
+        fields = {
+            "intent": str(payload.get("intent", "")),
+            "course": str(payload.get("course", "")),
+            "title": str(payload.get("title", "")),
+            "deadline": str(payload.get("deadline", "")),
+            "marks": payload.get("marks"),
+            "description": str(payload.get("description", "")),
+            "attachment_query": str(payload.get("attachment_query", "")),
+            "generated_kind": str(payload.get("generated_kind", "")),
+            "missing_fields": list(payload.get("missing_fields", [])),
+        }
+        return ParsedCommand(**fields)
+
+    def _ask_for_missing(self, command: ParsedCommand) -> str:
+        labels = {
+            "course": "class name",
+            "title": "assignment title",
+            "topic": "topic",
+            "message": "announcement message",
+            "deadline": "deadline (e.g. 7 July 2026 5 PM)",
+        }
+        wanted = ", ".join(labels.get(field, field) for field in command.missing_fields)
+
+        known = []
+        if command.course:
+            known.append(f"Class: {command.course}")
+        if command.title:
+            known.append(f"Topic: {command.title}")
+        if command.deadline:
+            known.append(f"Deadline: {command.deadline}")
+        if command.marks is not None:
+            known.append(f"Marks: {command.marks}")
+
+        lines = []
+        if known:
+            lines.append("Got it so far:")
+            lines.extend(f"- {item}" for item in known)
+            lines.append("")
+        lines.append(f"Please also send the {wanted}.")
+        return "\n".join(lines)
 
     def save_preview(self, phone: str, command: ParsedCommand) -> str:
         teacher = self.database.get_teacher_by_phone(normalize_phone(phone))

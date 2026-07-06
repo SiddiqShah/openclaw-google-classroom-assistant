@@ -56,6 +56,18 @@ class ChromaVectorStore:
             embedding_function=HashEmbeddingFunction(),
         )
 
+    def reset(self) -> None:
+        """Remove every entry from the collection.
+
+        Used to clear stale embeddings left behind by an older database
+        generation (chunk ids that no longer exist), which otherwise outrank and
+        crowd out the current chunks and break vector search.
+        """
+        existing = self.collection.get()
+        ids = existing.get("ids", [])
+        if ids:
+            self.collection.delete(ids=ids)
+
     def close(self) -> None:
         system = getattr(self.client, "_system", None)
         stop = getattr(system, "stop", None)

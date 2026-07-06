@@ -71,6 +71,10 @@ def parse_date(text: str, today: date) -> date | None:
     if iso:
         return date(int(iso.group("year")), int(iso.group("month")), int(iso.group("day")))
 
+    numeric = parse_numeric_date(text)
+    if numeric is not None:
+        return numeric
+
     month_name = re.search(
         r"(?P<day>\d{1,2})\s+(?P<month>[a-z]+)(?:\s+(?P<year>20\d{2}))?",
         text,
@@ -93,6 +97,42 @@ def parse_date(text: str, today: date) -> date | None:
             return today + timedelta(days=days_ahead)
 
     return None
+
+
+def parse_numeric_date(text: str) -> date | None:
+    """Parse slash / dash numeric dates like 7/7/2026, 07-07-2026, 2026/7/7.
+
+    Day-first is assumed (the common local convention), but the parser
+    disambiguates when one field is clearly out of range for a month.
+    """
+    ymd = re.search(r"\b(?P<year>20\d{2})[/.](?P<month>\d{1,2})[/.](?P<day>\d{1,2})\b", text)
+    if ymd:
+        return _safe_date(int(ymd.group("year")), int(ymd.group("month")), int(ymd.group("day")))
+
+    dmy = re.search(r"\b(?P<a>\d{1,2})[/\-.](?P<b>\d{1,2})[/\-.](?P<year>\d{2,4})\b", text)
+    if not dmy:
+        return None
+
+    a = int(dmy.group("a"))
+    b = int(dmy.group("b"))
+    year = int(dmy.group("year"))
+    if year < 100:
+        year += 2000
+
+    if a > 12 and b <= 12:
+        day, month = a, b
+    elif b > 12 and a <= 12:
+        day, month = b, a
+    else:
+        day, month = a, b  # default: day-first
+    return _safe_date(year, month, day)
+
+
+def _safe_date(year: int, month: int, day: int) -> date | None:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
 
 
 def parse_time(text: str) -> time | None:

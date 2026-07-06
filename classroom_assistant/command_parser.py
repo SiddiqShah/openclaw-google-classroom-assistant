@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from .report_query import is_report_query
+
 
 @dataclass(frozen=True)
 class ParsedCommand:
@@ -25,6 +27,12 @@ class CommandParser:
     def parse(self, text: str) -> ParsedCommand | None:
         normalized = normalize_spaces(text)
         lowered = normalized.lower()
+
+        # A question about submissions/completion is a report request, not a
+        # command to create anything. Bail out so the reporting path handles it
+        # instead of asking the teacher for a course/title/deadline.
+        if is_report_query(lowered):
+            return None
 
         if self._looks_like_ai_generation(lowered):
             return self._parse_ai_generation(normalized)
@@ -202,23 +210,45 @@ def extract_generated_course(text: str) -> str:
 
 
 def extract_title(text: str, intent_words: list[str]) -> str:
+    # Prefer high-precision matches. When nothing is clearly the title we return
+    # "" on purpose so the assistant asks for it, rather than guessing a course
+    # or connector phrase and publishing the wrong thing.
     field_title = extract_field(text, ["title", "topic"])
     if field_title:
         return field_title
 
-    for word in intent_words:
-        patterns = [
-            rf"(?:mein|me|main|for)\s+(?P<title>.+?)\s+{re.escape(word)}\b",
-            rf"{re.escape(word)}\s+(?:banao|create|upload|post|add)?\s*:?\s*(?P<title>.+?)(?:\.| deadline| due| marks| points| instructions|$)",
-            rf"(?P<title>.+?)\s+{re.escape(word)}\s+(?:banao|create|upload|post|add)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                title = cleanup_value(match.group("title"))
-                title = strip_course_prefix(title)
-                if title:
-                    return title
+    joined = "|".join(re.escape(word) for word in intent_words)
+    # Stop the title before the class ("for X"), other markers, or field labels.
+    stop = r"(?:\.|,| and | for | to | mein | deadline| due| marks| points| instructions| upload| post|$)"
+
+    # "<word> on|about|regarding X"  ->  "assignment on Joins for databases" = "Joins"
+    marker = re.search(rf"(?:{joined})\s+(?:on|about|regarding)\s+(?P<title>.+?){stop}", text, re.IGNORECASE)
+    if marker:
+        title = cleanup_value(marker.group("title"))
+        if title:
+            return title
+
+    # "mein/me/main/for X <word>"  ->  "SE Databases mein Python Loops assignment" = "Python Loops"
+    prefixed = re.search(rf"(?:mein|me|main|for)\s+(?P<title>.+?)\s+(?:{joined})\b", text, re.IGNORECASE)
+    if prefixed:
+        title = strip_course_prefix(cleanup_value(prefixed.group("title")))
+        if title:
+            return title
+
+    # "X <word> banao/create/..."  ->  "normalization notes upload" style
+    verbed = re.search(rf"(?P<title>.+?)\s+(?:{joined})\s+(?:banao|create|upload|post|add)", text, re.IGNORECASE)
+    if verbed:
+        title = strip_course_prefix(cleanup_value(verbed.group("title")))
+        if title:
+            return title
+
+    # Explicit colon form: "<word>: X" or "<word> banao: X"
+    coloned = re.search(rf"(?:{joined})\s+(?:banao|create|upload|post|add)?\s*:\s*(?P<title>.+?){stop}", text, re.IGNORECASE)
+    if coloned:
+        title = strip_course_prefix(cleanup_value(coloned.group("title")))
+        if title:
+            return title
+
     return ""
 
 
@@ -238,14 +268,21 @@ def extract_announcement_message(text: str) -> str:
 
 
 def extract_generated_topic(text: str, kind: str) -> str:
+    # Stop the topic at connectors ("and upload it to ..."), course markers,
+    # or field labels so free-form phrasings like
+    # "generate an assignment in normalization and upload it to databases class"
+    # yield just "normalization".
+    stop = r"(?:\.|,| and | & | deadline| due| marks| points| upload| post| for | to | in class| class\b|$)"
     patterns = [
-        rf"(?:generate|create)\s+(?:ai\s+)?{kind}\s+(?:for|on|about)\s+(?P<topic>.+?)(?:\.| deadline| due| marks| points|$)",
-        rf"{kind}\s+(?:for|on|about)\s+(?P<topic>.+?)(?:\.| deadline| due| marks| points|$)",
+        rf"(?:generate|create|make|prepare)\s+(?:an?\s+|the\s+|ai\s+)?{kind}\s+(?:for|on|about|in|regarding)\s+(?P<topic>.+?){stop}",
+        rf"{kind}\s+(?:for|on|about|in|regarding)\s+(?P<topic>.+?){stop}",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return cleanup_value(match.group("topic"))
+            topic = cleanup_value(match.group("topic"))
+            if topic:
+                return topic
     return ""
 
 

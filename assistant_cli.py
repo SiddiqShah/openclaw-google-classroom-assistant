@@ -2,7 +2,19 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
+
+# Documents (and Urdu/Arabic text) contain characters outside the Windows
+# console's default cp1252 encoding. Force UTF-8 so printing an answer never
+# crashes with UnicodeEncodeError (which previously killed `rag-ask`).
+for _stream in (sys.stdout, sys.stderr):
+    reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 from classroom_assistant.access_control import AccessController, normalize_phone
 from classroom_assistant.classroom_api import ClassroomService
@@ -20,6 +32,7 @@ from classroom_assistant.rag_assistant.processor import RagProcessingError, RagP
 from classroom_assistant.rag_assistant.qa import RagQuestionAnswerer
 from classroom_assistant.rag_assistant.store import RagStore
 from classroom_assistant.reminder_service import ReminderService
+from classroom_assistant.report_query import is_report_query, resolve_named
 from classroom_assistant.security import TokenCipher, TokenSecurityError
 from classroom_assistant.whatsapp_notifier import WhatsAppNotifier
 from classroom_assistant.workflow import WorkflowService
@@ -154,6 +167,21 @@ def route_classroom_message(db_path: Path, phone: str, text: str) -> str | None:
             return f"Could not list classes: {exc}"
         return render_course_list(courses)
 
+    if is_report_query(normalized):
+        return render_submission_report(
+            database=database,
+            classroom=classroom,
+            phone=phone,
+            query_text=text,
+        )
+
+    if looks_like_class_summary_question(normalized):
+        try:
+            courses = classroom.list_courses(phone=phone, sync=True)
+        except GoogleAuthError as exc:
+            return f"Could not check classes: {exc}"
+        return render_class_summary(courses)
+
     if normalized.isdigit():
         try:
             selected = classroom.select_course(phone=phone, selector=normalized)
@@ -164,6 +192,9 @@ def route_classroom_message(db_path: Path, phone: str, text: str) -> str | None:
                 f"{selected.display_name} selected.\n"
                 "Now you can create an assignment, upload material, or post an announcement."
             )
+        menu_reply = handle_menu_choice(normalized, reminders, database, classroom, phone)
+        if menu_reply:
+            return menu_reply
 
     select_match = re.search(r"(?:class|course)\s+(.+?)\s+(?:select|choose|chuno|karo)", normalized)
     if not select_match:
@@ -209,19 +240,59 @@ def route_classroom_message(db_path: Path, phone: str, text: str) -> str | None:
     if any(phrase in normalized for phrase in ["due today", "today deadlines", "deadlines today"]):
         return reminders.render_due_today(phone=phone)
 
-    if any(phrase in normalized for phrase in ["submission report", "submissions report", "who submitted"]):
-        return render_submission_report(database=database, classroom=classroom, phone=phone)
-
     parsed = CommandParser().parse(text)
-    if parsed:
-        if not parsed.is_complete:
-            return render_preview(parsed)
+    if parsed is None:
+        # Not a fresh command: it may be the teacher answering a question we
+        # asked earlier (e.g. supplying a missing topic or deadline).
         try:
-            return workflow.save_preview(phone=phone, command=parsed)
+            draft_reply = workflow.continue_draft(phone=phone, text=text)
         except GoogleAuthError as exc:
-            database.log_error(phone=phone, action="prepare_preview", error_type=type(exc).__name__, message=str(exc))
-            return f"Could not prepare preview: {exc}"
+            database.log_error(phone=phone, action="continue_draft", error_type=type(exc).__name__, message=str(exc))
+            return f"Could not continue: {exc}"
+        return draft_reply
 
+    try:
+        return workflow.handle_command(phone=phone, command=parsed, text=text)
+    except GoogleAuthError as exc:
+        database.log_error(phone=phone, action="prepare_preview", error_type=type(exc).__name__, message=str(exc))
+        return f"Could not prepare preview: {exc}"
+
+
+def looks_like_class_summary_question(normalized: str) -> bool:
+    return (
+        ("how many" in normalized and "class" in normalized)
+        or ("what" in normalized and "subject" in normalized)
+        or "subjects we have" in normalized
+        or "classes we have" in normalized
+    )
+
+
+def handle_menu_choice(
+    normalized: str,
+    reminders: ReminderService,
+    database: Database,
+    classroom: ClassroomService,
+    phone: str,
+) -> str | None:
+    if normalized == "1":
+        return (
+            "Send assignment details like:\n"
+            "SE Databases mein Normalization assignment banao. Deadline 20 July 2026 5 PM. Marks 20."
+        )
+    if normalized == "2":
+        return (
+            "Send material details like:\n"
+            "SE Operating System mein material upload karo: Title: CPU Scheduling Attach from Drive: CPU Scheduling"
+        )
+    if normalized == "3":
+        return (
+            "Send announcement details like:\n"
+            "SE Software Requirement Engineering mein announcement post karo: Tomorrow class is cancelled."
+        )
+    if normalized == "4":
+        return reminders.render_upcoming_deadlines(phone=phone)
+    if normalized == "5":
+        return render_submission_report(database=database, classroom=classroom, phone=phone)
     return None
 
 
@@ -441,37 +512,60 @@ def render_error_logs(database: Database, limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-def render_submission_report(database: Database, classroom: ClassroomService, phone: str) -> str:
+def render_submission_report(
+    database: Database,
+    classroom: ClassroomService,
+    phone: str,
+    query_text: str = "",
+) -> str:
     teacher = database.get_teacher_by_phone(normalize_phone(phone))
     if teacher is None:
         return "Teacher phone is not authorized."
 
-    assignments = database.latest_assignments(int(teacher["id"]), limit=1)
+    assignments = database.latest_assignments(int(teacher["id"]), limit=50)
     if not assignments:
         return "No created assignment found yet. Create an assignment first, then ask for a submission report."
 
-    latest = assignments[0]
+    # Resolve the class the teacher named (if any) against their real courses,
+    # then scope the assignment list to it. Nothing here is hard-coded to a
+    # particular class name, so it works for any teacher.
+    matched_course = _match_report_course(classroom, phone, query_text)
+    if matched_course is not None:
+        scoped = [a for a in assignments if str(a["google_course_id"]) == matched_course.id]
+        if not scoped:
+            return (
+                f"No assignment found yet for {matched_course.display_name}. "
+                "Create or sync an assignment for that class first, then ask for a report."
+            )
+        assignments = scoped
+
+    # Resolve which assignment the teacher meant; fall back to the latest one.
+    target = resolve_named(assignments, query_text, name_of=lambda a: str(a["title"]))
+    if target is None:
+        target = assignments[0]
+
     try:
         submissions = classroom.list_submissions(
             phone=phone,
-            course_id=str(latest["google_course_id"]),
-            coursework_id=str(latest["google_coursework_id"]),
+            course_id=str(target["google_course_id"]),
+            coursework_id=str(target["google_coursework_id"]),
         )
     except GoogleAuthError as exc:
         return f"Could not fetch submission report: {exc}"
 
     try:
-        student_names = classroom.list_students(phone=phone, course_id=str(latest["google_course_id"]))
+        student_names = classroom.list_students(phone=phone, course_id=str(target["google_course_id"]))
         roster_note = ""
     except GoogleAuthError as exc:
         student_names = {}
         roster_note = f"\n\nStudent names unavailable: {exc}"
 
     submitted_states = {"TURNED_IN", "RETURNED"}
+    total = len(submissions)
     submitted = sum(1 for item in submissions if item["state"] in submitted_states)
-    missing = max(len(submissions) - submitted, 0)
+    missing = max(total - submitted, 0)
     late = sum(1 for item in submissions if item["late"] == "True")
-    course = latest.get("course_name") or latest.get("google_course_id")
+    course = target.get("course_name") or target.get("google_course_id")
     missing_names = [
         student_names.get(item["userId"], item["userId"])
         for item in submissions
@@ -485,15 +579,25 @@ def render_submission_report(database: Database, classroom: ClassroomService, ph
     missing_block = render_name_list("Missing students", missing_names)
     late_block = render_name_list("Late students", late_names)
     return (
-        f"{latest['title']} Submission Report\n\n"
+        f"{target['title']} Submission Report\n\n"
         f"Course: {course}\n"
-        f"Submitted: {submitted}\n"
-        f"Missing or not turned in: {missing}\n"
+        f"Completed: {submitted} of {total} students submitted\n"
+        f"Not turned in: {missing}\n"
         f"Late: {late}"
         f"{missing_block}"
         f"{late_block}"
         f"{roster_note}"
     )
+
+
+def _match_report_course(classroom: ClassroomService, phone: str, query_text: str):
+    if not query_text:
+        return None
+    try:
+        courses = classroom.list_courses(phone=phone, sync=False)
+    except GoogleAuthError:
+        return None
+    return resolve_named(courses, query_text, name_of=lambda c: c.display_name)
 
 
 def render_name_list(title: str, names: list[str], limit: int = 10) -> str:
@@ -518,6 +622,24 @@ def render_course_list(courses: list) -> str:
     lines.append("")
     lines.append("Reply with class number or class name.")
     return "\n".join(lines)
+
+
+def render_class_summary(courses: list) -> str:
+    if not courses:
+        return "You currently have 0 active Google Classroom classes."
+
+    lines = [f"You currently have {len(courses)} active Google Classroom class(es):", ""]
+    for index, course in enumerate(courses, start=1):
+        subject = clean_subject_name(course.display_name)
+        lines.append(f"{index}. {course.display_name} - Subject: {subject}")
+    return "\n".join(lines)
+
+
+def clean_subject_name(display_name: str) -> str:
+    subject = display_name.replace("(A)", "").replace("(a)", "").strip()
+    if subject.lower().startswith("se "):
+        subject = subject[3:].strip()
+    return subject or display_name
 
 
 def build_google_auth_service(db_path: Path) -> GoogleAuthService:
@@ -1134,6 +1256,39 @@ def cmd_rag_process(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rag_reindex(args: argparse.Namespace) -> int:
+    from classroom_assistant.rag_assistant.vector_store import ChromaVectorStore, VectorStoreUnavailable
+
+    store = RagStore()
+    store.initialize()
+    documents = store.all_documents()
+    if not documents:
+        print("No RAG documents to reindex.")
+        return 0
+
+    try:
+        vector_store = ChromaVectorStore(store)
+    except VectorStoreUnavailable as exc:
+        print(f"Vector store unavailable: {exc}")
+        return 1
+
+    try:
+        vector_store.reset()
+        total_chunks = 0
+        indexed = 0
+        for document in documents:
+            count = vector_store.index_document(int(document["id"]))
+            total_chunks += count
+            if count:
+                indexed += 1
+            print(f"Reindexed: ID {document['id']} | {document['title']} | chunks: {count}")
+    finally:
+        vector_store.close()
+
+    print(f"\nVector index rebuilt: {indexed}/{len(documents)} document(s), {total_chunks} chunks.")
+    return 0
+
+
 def cmd_rag_delete(args: argparse.Namespace) -> int:
     store = RagStore()
     store.initialize()
@@ -1344,6 +1499,9 @@ def build_parser() -> argparse.ArgumentParser:
     rag_process.add_argument("--latest", action="store_true")
     rag_process.add_argument("--all", action="store_true")
     rag_process.set_defaults(func=cmd_rag_process)
+
+    rag_reindex = subparsers.add_parser("rag-reindex", help="Rebuild the vector index from current chunks (fixes stale/orphaned embeddings).")
+    rag_reindex.set_defaults(func=cmd_rag_reindex)
 
     rag_delete = subparsers.add_parser("rag-delete", help="Delete a RAG document and its chunks.")
     rag_delete.add_argument("--phone", required=True)

@@ -90,6 +90,14 @@ class RagStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def all_documents(self) -> list[dict[str, Any]]:
+        """Every document across all owners (used for a full vector reindex)."""
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "select id, owner_phone, title, status from rag_documents order by id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_document(self, document_id: int, owner_phone: str = "") -> dict[str, Any] | None:
         with closing(self.connect()) as connection:
             if owner_phone:

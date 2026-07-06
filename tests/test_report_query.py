@@ -5,7 +5,12 @@ from dataclasses import dataclass
 
 from assistant_cli import render_submission_report
 from classroom_assistant.command_parser import CommandParser
-from classroom_assistant.report_query import is_report_query, resolve_named
+from classroom_assistant.report_query import (
+    is_deadline_query,
+    is_due_today_query,
+    is_report_query,
+    resolve_named,
+)
 
 
 @dataclass
@@ -43,6 +48,40 @@ class ReportDetectionTests(unittest.TestCase):
             "how many student complete the assignment",
         ]:
             self.assertIsNone(parser.parse(text), text)
+
+
+class DeadlineQueryTests(unittest.TestCase):
+    def test_free_form_deadline_questions(self) -> None:
+        for text in [
+            "check all the classes and give me the submission deadlines",
+            "give me the submission deadlines",
+            "show deadlines",
+            "upcoming deadlines",
+            "reminders",
+            "what are my deadlines",
+            "when are assignments due",
+            "due soon",
+        ]:
+            self.assertTrue(is_deadline_query(text), text)
+
+    def test_create_commands_are_not_deadline_queries(self) -> None:
+        for text in [
+            "SE Databases mein Python Loops assignment banao. Deadline 15 July 2026 6 PM.",
+            "make an assignment on Joins for databases deadline 9/7/2026 5pm",
+            "meri classes dikhao",
+        ]:
+            self.assertFalse(is_deadline_query(text), text)
+
+    def test_bare_draft_answers_are_not_deadline_queries(self) -> None:
+        # A follow-up answer supplying a date must reach the draft, not the
+        # deadline-reminder path.
+        self.assertFalse(is_deadline_query("tomorrow 5pm"))
+        self.assertFalse(is_deadline_query("10 July 2026 5 pm"))
+
+    def test_due_today(self) -> None:
+        for text in ["due today", "deadlines today", "what is due today"]:
+            self.assertTrue(is_due_today_query(text), text)
+        self.assertFalse(is_due_today_query("upcoming deadlines"))
 
 
 class ResolveNamedTests(unittest.TestCase):

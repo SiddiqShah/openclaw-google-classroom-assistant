@@ -32,7 +32,12 @@ from classroom_assistant.rag_assistant.processor import RagProcessingError, RagP
 from classroom_assistant.rag_assistant.qa import RagQuestionAnswerer
 from classroom_assistant.rag_assistant.store import RagStore
 from classroom_assistant.reminder_service import ReminderService
-from classroom_assistant.report_query import is_report_query, resolve_named
+from classroom_assistant.report_query import (
+    is_deadline_query,
+    is_due_today_query,
+    is_report_query,
+    resolve_named,
+)
 from classroom_assistant.security import TokenCipher, TokenSecurityError
 from classroom_assistant.whatsapp_notifier import WhatsAppNotifier
 from classroom_assistant.workflow import WorkflowService
@@ -225,20 +230,11 @@ def route_classroom_message(db_path: Path, phone: str, text: str) -> str | None:
     if any(phrase in normalized for phrase in ["debug logs", "error logs", "recent errors"]):
         return render_error_logs(database=database)
 
-    if any(
-        phrase in normalized
-        for phrase in [
-            "upcoming deadlines",
-            "deadline reminders",
-            "reminders",
-            "show deadlines",
-            "due soon",
-        ]
-    ):
-        return reminders.render_upcoming_deadlines(phone=phone)
-
-    if any(phrase in normalized for phrase in ["due today", "today deadlines", "deadlines today"]):
+    if is_due_today_query(normalized):
         return reminders.render_due_today(phone=phone)
+
+    if is_deadline_query(normalized):
+        return reminders.render_upcoming_deadlines(phone=phone)
 
     parsed = CommandParser().parse(text)
     if parsed is None:

@@ -128,6 +128,56 @@ def is_report_query(text: str) -> bool:
     return False
 
 
+# --- Deadline / reminder questions -------------------------------------------
+
+DEADLINE_WORDS = {"deadline", "deadlines", "reminder", "reminders", "due"}
+
+# Query-shaped words that mark "tell me the deadlines" vs. a create command that
+# merely mentions a deadline.
+DEADLINE_QUERY_WORDS = {
+    "show", "check", "see", "give", "list", "tell", "what", "when", "which",
+    "upcoming", "pending", "remaining", "left", "all", "any", "my", "meri",
+    "mera", "dekho", "dikhao", "batao", "bta", "kab", "konsi", "soon",
+}
+
+# Verbs that mean the teacher is creating something (so a deadline word is just
+# a detail, not a request to list deadlines).
+_CREATE_VERBS = {
+    "banao", "create", "upload", "post", "announce", "add", "karo",
+    "generate", "make", "prepare",
+}
+
+
+def _is_create_command(text: str) -> bool:
+    return _contains_any(text, _CREATE_VERBS) and _contains_any(text, WORK_WORDS)
+
+
+def is_deadline_query(text: str) -> bool:
+    """True when the teacher is asking to see assignment deadlines / reminders."""
+    lowered = text.lower()
+    tokens = set(_tokens(lowered))
+    if not (tokens & DEADLINE_WORDS):
+        return False
+    if _is_create_command(lowered):
+        return False
+    # "reminder(s)" or "upcoming ..." are requests on their own.
+    if tokens & {"reminder", "reminders"} or "upcoming" in tokens:
+        return True
+    return _contains_any(lowered, DEADLINE_QUERY_WORDS)
+
+
+def is_due_today_query(text: str) -> bool:
+    """True for "what's due today" style questions (self-contained: "today" +
+    a deadline word is enough, without needing a separate query verb)."""
+    lowered = text.lower()
+    tokens = set(_tokens(lowered))
+    if not (tokens & {"today", "aaj"}):
+        return False
+    if not (tokens & DEADLINE_WORDS):
+        return False
+    return not _is_create_command(lowered)
+
+
 def _significant(name: str) -> list[str]:
     return [t for t in _tokens(name) if t not in _STOPWORDS and len(t) >= 3]
 
